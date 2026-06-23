@@ -2,10 +2,33 @@ require('dotenv').config()
 const express = require('express')
 const cors = require('cors')
 const axios = require('axios')
+const { MongoClient } = require('mongodb')
 
 const app = express()
 const PORT = process.env.PORT || 3000
 const BACKEND_URL = process.env.BACKEND_URL || 'http://localhost:4000'
+
+// ── Configuración de MongoDB
+const MONGO_URI = process.env.MONGO_URI || 'mongodb://localhost:27017'
+const MONGO_DB_NAME = process.env.MONGO_DB_NAME || 'psicored'
+let mongoClient = null
+let mongoDb = null
+let isMongoConnected = false
+
+const connectMongo = async () => {
+  try {
+    mongoClient = new MongoClient(MONGO_URI, { serverSelectionTimeoutMS: 3000 })
+    await mongoClient.connect()
+    mongoDb = mongoClient.db(MONGO_DB_NAME)
+    isMongoConnected = true
+    console.log(`📡 Conectado a MongoDB en ${MONGO_URI}/${MONGO_DB_NAME}`)
+  } catch (err) {
+    console.warn(`⚠️ Advertencia: No se pudo conectar a MongoDB. Los endpoints de Mongo no funcionarán pero el BFF seguirá corriendo. Error: ${err.message}`)
+    isMongoConnected = false
+    mongoClient = null
+    mongoDb = null
+  }
+}
 
 app.use(cors())
 app.use(express.json())
@@ -97,12 +120,75 @@ app.post('/api/recursos', (req, res) => proxy(req, res, '/api/recursos'))
 app.put('/api/recursos/:id', (req, res) => proxy(req, res, `/api/recursos/${req.params.id}`))
 app.delete('/api/recursos/:id', (req, res) => proxy(req, res, `/api/recursos/${req.params.id}`))
 
-// ── Health check
-app.get('/api/health', (req, res) => {
-  res.json({ bff: 'ok', backend: BACKEND_URL })
+// ── MongoDB Caching Simulation (Api-Mongo)
+app.post('/api/mongo/sync', async (req, res) => {
+  if (!isMongoConnected || !mongoDb) {
+    return res.status(503).json({ error: 'El servicio de caché (MongoDB) no está disponible en este momento.' })
+  }
+  try {
+    // 1. Fetch patients from Backend
+    const url = `${BACKEND_URL}/api/pacientes`
+    const headers = buildHeaders(req)
+    
+    const response = await axios.get(url, { headers })
+    const patients = response.data
+
+    if (!Array.isArray(patients)) {
+      return res.status(500).json({ error: 'La respuesta del Backend no es un listado válido de pacientes.' })
+    }
+
+    // 2. Clear and Insert into MongoDB
+    // Drop existing collection to clear old schema and indexes (e.g. unique constraints like dni_1)
+    await mongoDb.collection('pacientes').drop().catch(() => {
+      // If collection doesn't exist yet, ignore
+    })
+    
+    const collection = mongoDb.collection('pacientes')
+    
+    let synchronizedCount = 0
+    if (patients.length > 0) {
+      const result = await collection.insertMany(patients)
+      synchronizedCount = result.insertedCount
+    }
+
+    res.json({
+      message: 'Sincronización con MongoDB completada exitosamente.',
+      sourceCount: patients.length,
+      synchronizedCount
+    })
+  } catch (err) {
+    console.error('Error al sincronizar con MongoDB:', err.message)
+    const status = err.response?.status || 500
+    const data = err.response?.data || { error: 'Error durante la sincronización de caché.' }
+    res.status(status).json(data)
+  }
 })
 
-app.listen(PORT, () => {
+app.get('/api/mongo/pacientes', async (req, res) => {
+  if (!isMongoConnected || !mongoDb) {
+    return res.status(503).json({ error: 'El servicio de caché (MongoDB) no está disponible en este momento.' })
+  }
+  try {
+    const collection = mongoDb.collection('pacientes')
+    const patients = await collection.find({}).toArray()
+    res.json(patients)
+  } catch (err) {
+    console.error('Error al consultar MongoDB:', err.message)
+    res.status(500).json({ error: 'Error al consultar la base de datos de caché.' })
+  }
+})
+
+// ── Health check
+app.get('/api/health', (req, res) => {
+  res.json({ 
+    bff: 'ok', 
+    backend: BACKEND_URL, 
+    mongodb: isMongoConnected ? 'connected' : 'disconnected' 
+  })
+})
+
+app.listen(PORT, async () => {
   console.log(`\n --> BFF PsicoRed corriendo en http://localhost:${PORT}`)
   console.log(`   Proxy hacia Backend: ${BACKEND_URL}\n`)
+  await connectMongo()
 })
